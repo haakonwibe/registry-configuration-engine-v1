@@ -2,7 +2,7 @@
 
 A declarative, flexible approach to managing Windows registry settings through Microsoft Intune Remediations.
 
-[![Poster](docs/images/poster-preview.png)](docs/poster.html)
+[![Poster](docs/images/poster-preview.png)](https://haakonwibe.github.io/registry-configuration-engine-v1/poster.html)
    
 *Click the image to view the interactive poster*
 
