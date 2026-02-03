@@ -1,6 +1,6 @@
 # Registry Configuration Engine for Microsoft Intune
 
-A declarative, enterprise-ready approach to managing Windows registry settings through Microsoft Intune Remediations.
+A declarative, flexible approach to managing Windows registry settings through Microsoft Intune Remediations.
 
 [![Poster](docs/images/poster-preview.png)](docs/poster.html)
    
@@ -431,6 +431,16 @@ Contributions are welcome! Please:
 2. Include comments explaining non-obvious settings
 3. Follow the established JSON structure
 4. Update documentation for new features
+
+## ⚠️ Disclaimer
+
+This tool is provided as-is, without warranty of any kind. Use at your own risk.
+
+- Always test configurations in a non-production environment first
+- Review generated scripts before deploying to Intune
+- The authors are not liable for any damage or issues caused by using this tool
+
+By using this software, you accept full responsibility for any changes made to your systems.
 
 ## 📜 License
 
