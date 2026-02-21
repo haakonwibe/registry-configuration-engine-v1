@@ -295,38 +295,7 @@ Use these placeholders in string values - they're expanded at runtime:
 
 > **Tip**: For values using `{{DATETIME}}`, add `"skipDetection": true` to prevent false non-compliance reports. Since the time changes each run, the value written during remediation will never match the expected value during detection.
 
-## 🔧 Deployment to Intune
-
-### Embedding Configuration (Recommended for Most Users)
-
-For Intune deployment, embed your JSON directly in the script:
-
-1. Open `Invoke-RegistryConfigEngine.ps1`
-2. Find the `#region Main Execution` section
-3. Add your embedded config before the `try` block:
-
-```powershell
-# Embedded configuration for Intune deployment
-$EmbeddedConfig = @'
-{
-  "version": "1.0",
-  "settings": [
-    // Your configuration here
-  ]
-}
-'@
-
-# Save to temp file
-$TempConfigPath = Join-Path $env:TEMP "RegistryConfig_$(Get-Random).json"
-$EmbeddedConfig | Out-File -FilePath $TempConfigPath -Encoding UTF8
-$ConfigPath = $TempConfigPath
-```
-
-4. Create two copies:
-   - **Detection**: Set `$Mode = 'Detect'` at the top
-   - **Remediation**: Set `$Mode = 'Remediate'` at the top
-
-### Intune Remediation Settings
+## 🔧 Intune Remediation Settings
 
 | Setting | Value |
 |---------|-------|
