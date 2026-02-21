@@ -28,14 +28,14 @@ Registry Configuration Engine for Microsoft Intune - a PowerShell-based tool tha
 
 ### Packaging for Intune
 ```powershell
-# Generate detection and remediation scripts (outputs to Packages/ by default)
+# Generate detection and remediation scripts (outputs to current directory by default)
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json"
 
 # Custom output location and prefix
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\config.json" -OutputPath ".\Packages" -Prefix "CompanySettings"
 
-# Enable Windows Event Log logging in generated scripts
-.\New-IntunePackage.ps1 -ConfigPath ".\Configs\config.json" -CreateEventLog
+# Enable detailed per-value logging in generated scripts
+.\New-IntunePackage.ps1 -ConfigPath ".\Configs\config.json" -VerboseLogging
 ```
 
 ### Creating Configurations from Registry Exports
@@ -63,7 +63,7 @@ regedit /e "C:\temp\settings.reg" "HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsof
 - `Validate` - Parse and validate JSON without registry access
 - `Rollback` - Restore previous values from transaction log
 
-**New-IntunePackage.ps1**: Packages JSON config into self-contained Intune scripts by embedding both the configuration and a minified engine.
+**New-IntunePackage.ps1**: Packages JSON config into self-contained Intune scripts by embedding both the configuration and a minified engine. Generated scripts always log to Windows Event Log and file log (`C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log` with 30-day retention). Use `-VerboseLogging` for per-value detail. Scripts auto-detect 32-bit PowerShell and relaunch via SysNative for 64-bit registry access.
 
 **ConvertFrom-RegistryExport.ps1**: Converts Windows Registry export (.reg) files to JSON configuration format. Supports all registry value types and automatically maps HKLM→Machine, HKCU→User scopes.
 
@@ -154,3 +154,7 @@ Get-ChildItem "$env:ProgramData\RegistryConfigEngine\Transactions\*.json"
 - Binary values accept comma-separated hex (`"3C,00,00,00"`), hex string (`"3C000000"`), or array (`[60, 0, 0, 0]`)
 - Scripts designed to run as SYSTEM through Intune (no logged-on user dependency)
 - All scripts require PowerShell 5.1+ (compatible with Intune Remediations which use Windows PowerShell)
+- Packaged scripts auto-relaunch in 64-bit PowerShell if started in 32-bit (via `$env:SystemRoot\SysNative`)
+- Logging is always on in packaged scripts: Windows Event Log (Application/RegistryConfigEngine) + file log with 30-day retention
+- `NotExists` comparison: detection checks value is absent; remediation deletes the value (instead of trying to set it)
+- `skipDetection` and all comparison operators are fully supported in the packaged template (not just the main engine)

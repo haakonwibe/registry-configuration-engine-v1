@@ -11,6 +11,10 @@
     The JSON configuration is embedded directly in the scripts, making them
     portable and easy to deploy without external file dependencies.
 
+    Generated scripts always log to:
+    - Windows Event Log (Application log, source: RegistryConfigEngine)
+    - Log file at C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log
+
 .PARAMETER ConfigPath
     Path to the JSON configuration file to package.
 
@@ -21,13 +25,14 @@
 .PARAMETER Prefix
     Prefix for the output file names. Default is the config file name without extension.
 
-.PARAMETER CreateEventLog
-    If specified, the generated scripts will write entries to the Windows Event Log
-    (Application log, source: RegistryConfigEngine) in addition to standard output.
+.PARAMETER VerboseLogging
+    If specified, the generated scripts will log per-value details (each registry
+    check/change with path, value name, expected vs current). Without this switch,
+    scripts log only a summary per run.
 
 .EXAMPLE
     .\New-IntunePackage.ps1 -ConfigPath ".\Samples\01-corporate-branding.json"
-    
+
     Creates:
     - corporate-branding-Detect.ps1
     - corporate-branding-Remediate.ps1
@@ -40,9 +45,9 @@
     - C:\Intune\CompanySettings-Remediate.ps1
 
 .EXAMPLE
-    .\New-IntunePackage.ps1 -ConfigPath ".\my-config.json" -CreateEventLog
+    .\New-IntunePackage.ps1 -ConfigPath ".\my-config.json" -VerboseLogging
 
-    Creates scripts that also write to the Windows Event Log (Application log, source: RegistryConfigEngine).
+    Creates scripts with detailed per-value logging enabled.
 
 .NOTES
     Author: Haakon Wibe
@@ -62,7 +67,7 @@ param(
     [string]$Prefix,
 
     [Parameter()]
-    [switch]$CreateEventLog
+    [switch]$VerboseLogging
 )
 
 # Determine output prefix
@@ -74,11 +79,11 @@ if ([string]::IsNullOrEmpty($Prefix)) {
 try {
     $configContent = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
     $config = $configContent | ConvertFrom-Json
-    
+
     if (-not $config.settings) {
         throw "Invalid configuration: missing 'settings' array"
     }
-    
+
     Write-Host "✅ Configuration loaded: $($config.description)" -ForegroundColor Green
     Write-Host "   Settings groups: $($config.settings.Count)" -ForegroundColor Cyan
 }
@@ -96,7 +101,7 @@ $scriptTemplate = @'
 
 .DESCRIPTION
     {DESCRIPTION}
-    
+
     Configuration Version: {VERSION}
     Generated: {GENERATED}
 
@@ -106,6 +111,31 @@ $scriptTemplate = @'
 #>
 
 #Requires -Version 5.1
+
+# ============================================================================
+# 64-BIT ARCHITECTURE CHECK
+# ============================================================================
+if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    $relaunchMsg = "Script launched in 32-bit PowerShell on 64-bit OS. Relaunching in 64-bit mode."
+    Write-Output "[REGENGINE] [WARN] $relaunchMsg"
+    try {
+        $logDir = "$env:ProgramData\RegistryConfigEngine\Logs"
+        if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        "[$timestamp] [WARN] [{SOURCE}] $relaunchMsg" | Out-File -FilePath "$logDir\RegistryConfigEngine.log" -Encoding UTF8 -Append
+    } catch { }
+    try {
+        $eventSource = "RegistryConfigEngine"
+        if (-not [System.Diagnostics.EventLog]::SourceExists($eventSource)) {
+            New-EventLog -LogName Application -Source $eventSource -ErrorAction SilentlyContinue
+        }
+        Write-EventLog -LogName Application -Source $eventSource -EventId 1000 -EntryType Warning -Message $relaunchMsg
+    } catch { }
+    $scriptPath = $MyInvocation.MyCommand.Definition
+    $ps64 = "$env:SystemRoot\SysNative\WindowsPowerShell\v1.0\powershell.exe"
+    $process = Start-Process -FilePath $ps64 -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Wait -PassThru -NoNewWindow
+    exit $process.ExitCode
+}
 
 # ============================================================================
 # EMBEDDED CONFIGURATION
@@ -121,9 +151,13 @@ $EmbeddedConfig = @'
 $script:EngineVersion = "1.0.0"
 $script:LogPrefix = "[REGENGINE]"
 $script:Mode = "{MODEVALUE}"
-$script:CreateEventLog = {CREATEEVENTLOG}
+$script:VerboseLogging = {VERBOSELOGGING}
+$script:ConfigName = "{SOURCE}"
 $script:EventLogSource = "RegistryConfigEngine"
 $script:EventLogName = "Application"
+$script:FileLogDir = "$env:ProgramData\RegistryConfigEngine\Logs"
+$script:FileLogPath = "$script:FileLogDir\RegistryConfigEngine.log"
+$script:LogRetentionDays = 30
 
 # Exit codes for Intune
 $script:ExitCodes = @{
@@ -133,8 +167,45 @@ $script:ExitCodes = @{
     RemediationFail = 1
 }
 
+function Invoke-LogCleanup {
+    try {
+        if (-not (Test-Path $script:FileLogPath)) { return }
+        $cutoff = (Get-Date).AddDays(-$script:LogRetentionDays).ToString("yyyy-MM-dd")
+        $lines = Get-Content -Path $script:FileLogPath -ErrorAction SilentlyContinue
+        if (-not $lines -or $lines.Count -eq 0) { return }
+        $kept = @()
+        foreach ($line in $lines) {
+            if ($line -match '^\[(\d{4}-\d{2}-\d{2})') {
+                if ($Matches[1] -ge $cutoff) { $kept += $line }
+            } else {
+                $kept += $line
+            }
+        }
+        $kept | Out-File -FilePath $script:FileLogPath -Encoding UTF8 -Force
+    } catch { }
+}
+
+function Write-FileLog {
+    param([string]$Message, [string]$Level = 'Info')
+    try {
+        if (-not (Test-Path $script:FileLogDir)) {
+            New-Item -Path $script:FileLogDir -ItemType Directory -Force | Out-Null
+        }
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $levelTag = switch ($Level) {
+            'Warning' { "WARN" }
+            'Error'   { "ERROR" }
+            'Success' { "OK" }
+            default   { "INFO" }
+        }
+        $entry = "[$timestamp] [$levelTag] [$($script:ConfigName)] $Message"
+        $entry | Out-File -FilePath $script:FileLogPath -Encoding UTF8 -Append
+    } catch { }
+}
+
 function Write-Log {
-    param([string]$Message, [string]$Level = 'Info', [int]$EventId = 1000)
+    param([string]$Message, [string]$Level = 'Info', [int]$EventId = 1000, [switch]$VerboseOnly)
+    if ($VerboseOnly -and -not $script:VerboseLogging) { return }
     $prefix = switch ($Level) {
         'Warning' { "[WARN]" }
         'Error'   { "[ERROR]" }
@@ -143,7 +214,9 @@ function Write-Log {
     }
     Write-Output "$script:LogPrefix $prefix $Message"
 
-    if ($script:CreateEventLog -and ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-FileLog -Message $Message -Level $Level
+
+    if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         try {
             if (-not [System.Diagnostics.EventLog]::SourceExists($script:EventLogSource)) {
                 New-EventLog -LogName $script:EventLogName -Source $script:EventLogSource -ErrorAction SilentlyContinue
@@ -157,7 +230,7 @@ function Write-Log {
 function Get-UserProfileSIDs {
     $userSIDs = @()
     try {
-        Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | 
+        Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
             Where-Object { $_.PSChildName -match '^S-1-5-21-|^S-1-12-1-' } |
             Where-Object { $_.PSChildName -notmatch '_Classes$' } |
             ForEach-Object {
@@ -254,23 +327,52 @@ function Expand-ConfigVariables {
 }
 
 function Compare-RegistryValue {
-    param([string]$Path, [string]$Name, [string]$Type, $ExpectedValue)
+    param([string]$Path, [string]$Name, [string]$Type, $ExpectedValue, [string]$Comparison = 'Equals')
     try {
-        if (-not (Test-Path $Path)) { return @{ Match = $false; Current = $null; Reason = "Key does not exist" } }
-        $currentValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
-        if ($null -eq $currentValue -or -not ($currentValue.PSObject.Properties.Name -contains $Name)) {
-            return @{ Match = $false; Current = $null; Reason = "Value does not exist" }
+        $keyExists = Test-Path $Path
+        $valueExists = $false
+        $actualValue = $null
+        if ($keyExists) {
+            $currentValue = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+            $valueExists = $null -ne $currentValue -and ($currentValue.PSObject.Properties.Name -contains $Name)
+            if ($valueExists) { $actualValue = $currentValue.$Name }
         }
-        $actualValue = $currentValue.$Name
+        if ($Comparison -eq 'Exists') {
+            return @{ Match = $valueExists; Current = $actualValue; Reason = if ($valueExists) { "Value exists" } else { "Value does not exist" } }
+        }
+        if ($Comparison -eq 'NotExists') {
+            return @{ Match = -not $valueExists; Current = $actualValue; Reason = if (-not $valueExists) { "Value does not exist (as expected)" } else { "Value exists (should not)" } }
+        }
+        if (-not $keyExists) { return @{ Match = $false; Current = $null; Reason = "Key does not exist" } }
+        if (-not $valueExists) { return @{ Match = $false; Current = $null; Reason = "Value does not exist" } }
         $convertedExpected = Convert-RegistryValue -Type $Type -Value $ExpectedValue
-        if ($Type.ToLower() -eq 'binary') {
-            $match = $null -ne $actualValue -and $actualValue.Length -eq $convertedExpected.Length -and -not (Compare-Object $actualValue $convertedExpected)
-        } elseif ($Type.ToLower() -eq 'multistring') {
-            $match = $null -ne $actualValue -and -not (Compare-Object $actualValue $convertedExpected)
-        } else {
-            $match = $actualValue -eq $convertedExpected
+        $match = $false; $reason = ""
+        switch ($Comparison) {
+            'Equals' {
+                if ($Type.ToLower() -eq 'binary') {
+                    $match = $null -ne $actualValue -and $actualValue.Length -eq $convertedExpected.Length -and -not (Compare-Object $actualValue $convertedExpected)
+                } elseif ($Type.ToLower() -eq 'multistring') {
+                    $match = $null -ne $actualValue -and -not (Compare-Object $actualValue $convertedExpected)
+                } else { $match = $actualValue -eq $convertedExpected }
+                $reason = if ($match) { "Values match" } else { "Values differ" }
+            }
+            'NotEquals' {
+                if ($Type.ToLower() -eq 'binary') {
+                    $match = $null -eq $actualValue -or $actualValue.Length -ne $convertedExpected.Length -or (Compare-Object $actualValue $convertedExpected)
+                } elseif ($Type.ToLower() -eq 'multistring') {
+                    $match = $null -eq $actualValue -or (Compare-Object $actualValue $convertedExpected)
+                } else { $match = $actualValue -ne $convertedExpected }
+                $reason = if ($match) { "Values differ (as expected)" } else { "Values match (should differ)" }
+            }
+            'GreaterThan'        { $match = $actualValue -gt $convertedExpected; $reason = if ($match) { "Value $actualValue > $convertedExpected" } else { "Value $actualValue is not > $convertedExpected" } }
+            'GreaterThanOrEqual' { $match = $actualValue -ge $convertedExpected; $reason = if ($match) { "Value $actualValue >= $convertedExpected" } else { "Value $actualValue is not >= $convertedExpected" } }
+            'LessThan'           { $match = $actualValue -lt $convertedExpected; $reason = if ($match) { "Value $actualValue < $convertedExpected" } else { "Value $actualValue is not < $convertedExpected" } }
+            'LessThanOrEqual'    { $match = $actualValue -le $convertedExpected; $reason = if ($match) { "Value $actualValue <= $convertedExpected" } else { "Value $actualValue is not <= $convertedExpected" } }
+            'Contains'           { $match = $actualValue -like "*$convertedExpected*"; $reason = if ($match) { "Value contains '$convertedExpected'" } else { "Value does not contain '$convertedExpected'" } }
+            'StartsWith'         { $match = $actualValue -like "$convertedExpected*"; $reason = if ($match) { "Value starts with '$convertedExpected'" } else { "Value does not start with '$convertedExpected'" } }
+            'EndsWith'           { $match = $actualValue -like "*$convertedExpected"; $reason = if ($match) { "Value ends with '$convertedExpected'" } else { "Value does not end with '$convertedExpected'" } }
         }
-        return @{ Match = $match; Current = $actualValue; Reason = if ($match) { "Values match" } else { "Values differ" } }
+        return @{ Match = $match; Current = $actualValue; Reason = $reason }
     } catch {
         return @{ Match = $false; Current = $null; Reason = "Error: $_" }
     }
@@ -281,7 +383,9 @@ function Compare-RegistryValue {
 # ============================================================================
 
 try {
+    Invoke-LogCleanup
     $config = $EmbeddedConfig | ConvertFrom-Json
+    Write-Log "Starting $($script:Mode) run on $env:COMPUTERNAME" -Level Info
     $compliant = $true
     $nonCompliantCount = 0
     $changesApplied = 0
@@ -290,7 +394,7 @@ try {
         $scope = $settingGroup.scope
         $basePath = $settingGroup.path
         $action = if ($settingGroup.action) { $settingGroup.action } else { "Set" }
-        
+
         $registryPaths = @()
         switch ($scope.ToLower()) {
             'machine' { $registryPaths += @{ Path = "HKLM:\$basePath"; Context = "Machine" } }
@@ -309,16 +413,24 @@ try {
 
         foreach ($regPath in $registryPaths) {
             $fullPath = $regPath.Path
-            
+
             if ($script:Mode -eq 'Detect') {
                 switch ($action.ToLower()) {
                     'set' {
                         foreach ($value in $settingGroup.values) {
+                            if ($value.skipDetection -eq $true) {
+                                Write-Log "$($regPath.Context) | $basePath\$($value.name) - Skipped (skipDetection)" -Level Info -VerboseOnly
+                                continue
+                            }
                             $expandedValue = Expand-ConfigVariables -Value $value.data
-                            $comparison = Compare-RegistryValue -Path $fullPath -Name $value.name -Type $value.type -ExpectedValue $expandedValue
+                            $comparisonOperator = if ($value.comparison) { $value.comparison } else { 'Equals' }
+                            $comparison = Compare-RegistryValue -Path $fullPath -Name $value.name -Type $value.type -ExpectedValue $expandedValue -Comparison $comparisonOperator
                             if (-not $comparison.Match) {
+                                Write-Log "$($regPath.Context) | $basePath\$($value.name) - $($comparison.Reason) (expected: $expandedValue, current: $($comparison.Current))" -Level Warning -VerboseOnly
                                 $compliant = $false
                                 $nonCompliantCount++
+                            } else {
+                                Write-Log "$($regPath.Context) | $basePath\$($value.name) - Compliant" -Level Info -VerboseOnly
                             }
                         }
                     }
@@ -327,16 +439,22 @@ try {
                             if (Test-Path $fullPath) {
                                 $item = Get-ItemProperty -Path $fullPath -Name $value.name -ErrorAction SilentlyContinue
                                 if ($null -ne $item -and ($item.PSObject.Properties.Name -contains $value.name)) {
+                                    Write-Log "$($regPath.Context) | $basePath\$($value.name) - Value exists (should be deleted)" -Level Warning -VerboseOnly
                                     $compliant = $false
                                     $nonCompliantCount++
+                                } else {
+                                    Write-Log "$($regPath.Context) | $basePath\$($value.name) - Compliant (value absent)" -Level Info -VerboseOnly
                                 }
                             }
                         }
                     }
                     'deletekey' {
                         if (Test-Path $fullPath) {
+                            Write-Log "$($regPath.Context) | $basePath - Key exists (should be deleted)" -Level Warning -VerboseOnly
                             $compliant = $false
                             $nonCompliantCount++
+                        } else {
+                            Write-Log "$($regPath.Context) | $basePath - Compliant (key absent)" -Level Info -VerboseOnly
                         }
                     }
                 }
@@ -346,12 +464,25 @@ try {
                     'set' {
                         if (-not (Test-Path $fullPath)) {
                             New-Item -Path $fullPath -Force | Out-Null
+                            Write-Log "$($regPath.Context) | Created key: $basePath" -Level Info -VerboseOnly
                         }
                         foreach ($value in $settingGroup.values) {
+                            if ($value.comparison -eq 'NotExists') {
+                                if (Test-Path $fullPath) {
+                                    $item = Get-ItemProperty -Path $fullPath -Name $value.name -ErrorAction SilentlyContinue
+                                    if ($null -ne $item -and ($item.PSObject.Properties.Name -contains $value.name)) {
+                                        Remove-ItemProperty -Path $fullPath -Name $value.name -Force
+                                        Write-Log "$($regPath.Context) | Deleted (NotExists): $basePath\$($value.name)" -Level Info -VerboseOnly
+                                        $changesApplied++
+                                    }
+                                }
+                                continue
+                            }
                             $expandedValue = Expand-ConfigVariables -Value $value.data
                             $convertedValue = Convert-RegistryValue -Type $value.type -Value $expandedValue
                             $valueKind = Get-RegistryTypeKind -Type $value.type
                             Set-ItemProperty -Path $fullPath -Name $value.name -Value $convertedValue -Type $valueKind
+                            Write-Log "$($regPath.Context) | Set $basePath\$($value.name) = $expandedValue" -Level Info -VerboseOnly
                             $changesApplied++
                         }
                     }
@@ -361,6 +492,7 @@ try {
                                 $item = Get-ItemProperty -Path $fullPath -Name $value.name -ErrorAction SilentlyContinue
                                 if ($null -ne $item -and ($item.PSObject.Properties.Name -contains $value.name)) {
                                     Remove-ItemProperty -Path $fullPath -Name $value.name -Force
+                                    Write-Log "$($regPath.Context) | Deleted value: $basePath\$($value.name)" -Level Info -VerboseOnly
                                     $changesApplied++
                                 }
                             }
@@ -369,12 +501,13 @@ try {
                     'deletekey' {
                         if (Test-Path $fullPath) {
                             Remove-Item -Path $fullPath -Recurse -Force
+                            Write-Log "$($regPath.Context) | Deleted key: $basePath" -Level Info -VerboseOnly
                             $changesApplied++
                         }
                     }
                 }
             }
-            
+
             if ($regPath.HiveInfo -and $regPath.HiveInfo.NeedsUnload) {
                 Dismount-DefaultUserHive -TempKey $regPath.HiveInfo.TempKey
             }
@@ -383,19 +516,19 @@ try {
 
     if ($script:Mode -eq 'Detect') {
         if ($compliant) {
-            Write-Output "$script:LogPrefix COMPLIANT - All settings are correct"
+            Write-Log "COMPLIANT - All settings are correct" -Level Success
             exit $script:ExitCodes.Compliant
         } else {
-            Write-Output "$script:LogPrefix NON-COMPLIANT - $nonCompliantCount setting(s) need remediation"
+            Write-Log "NON-COMPLIANT - $nonCompliantCount setting(s) need remediation" -Level Warning
             exit $script:ExitCodes.NonCompliant
         }
     } else {
-        Write-Output "$script:LogPrefix SUCCESS - $changesApplied change(s) applied"
+        Write-Log "SUCCESS - $changesApplied change(s) applied" -Level Success
         exit $script:ExitCodes.RemediationOK
     }
 }
 catch {
-    Write-Output "$script:LogPrefix ERROR - $_"
+    Write-Log "ERROR - $_" -Level Error
     exit 1
 }
 '@
@@ -412,7 +545,7 @@ if (-not (Test-Path $OutputPath)) {
 $detectScript = $scriptTemplate `
     -replace '\{MODE\}', 'Detection' `
     -replace '\{MODEVALUE\}', 'Detect' `
-    -replace '\{CREATEEVENTLOG\}', $(if ($CreateEventLog) { '$true' } else { '$false' }) `
+    -replace '\{VERBOSELOGGING\}', $(if ($VerboseLogging) { '$true' } else { '$false' }) `
     -replace '\{DESCRIPTION\}', ($config.description ?? "Registry configuration detection") `
     -replace '\{VERSION\}', ($config.version ?? "1.0") `
     -replace '\{AUTHOR\}', ($config.author ?? "Unknown") `
@@ -428,7 +561,7 @@ Write-Host "📄 Detection script: $detectPath" -ForegroundColor Yellow
 $remediateScript = $scriptTemplate `
     -replace '\{MODE\}', 'Remediation' `
     -replace '\{MODEVALUE\}', 'Remediate' `
-    -replace '\{CREATEEVENTLOG\}', $(if ($CreateEventLog) { '$true' } else { '$false' }) `
+    -replace '\{VERBOSELOGGING\}', $(if ($VerboseLogging) { '$true' } else { '$false' }) `
     -replace '\{DESCRIPTION\}', ($config.description ?? "Registry configuration remediation") `
     -replace '\{VERSION\}', ($config.version ?? "1.0") `
     -replace '\{AUTHOR\}', ($config.author ?? "Unknown") `
@@ -444,8 +577,10 @@ Write-Host ""
 Write-Host "✅ Package complete! Upload these scripts to Intune Remediations:" -ForegroundColor Green
 Write-Host "   Detection script:   $detectPath" -ForegroundColor Cyan
 Write-Host "   Remediation script: $remediatePath" -ForegroundColor Cyan
-if ($CreateEventLog) {
-    Write-Host "   Event logging:      Enabled (Application log, source: RegistryConfigEngine)" -ForegroundColor Cyan
+Write-Host "   Event logging:      Enabled (Application log, source: RegistryConfigEngine)" -ForegroundColor Cyan
+Write-Host "   File logging:       $env:ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log" -ForegroundColor Cyan
+if ($VerboseLogging) {
+    Write-Host "   Verbose logging:    Enabled (per-value details)" -ForegroundColor Cyan
 }
 Write-Host ""
 Write-Host "📋 Intune Settings:" -ForegroundColor Yellow

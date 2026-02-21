@@ -2,20 +2,20 @@
   "$schema": "https://alttabtowork.com/schemas/registry-config-v1.json",
   "version": "1.0",
   "author": "Haakon Wibe",
-  "description": "Corporate branding and baseline settings for Contoso organization",
+  "description": "Corporate branding and baseline settings for Hawkweave organization",
   "created": "2026-01-28",
   "settings": [
     {
       "name": "Corporate Branding - Machine",
       "description": "Machine-level corporate identification settings",
       "scope": "Machine",
-      "path": "SOFTWARE\\Contoso\\Corporate",
+      "path": "SOFTWARE\\Hawkweave\\Corporate",
       "action": "Set",
       "values": [
         {
           "name": "ManagedBy",
           "type": "String",
-          "data": "Contoso IT Department"
+          "data": "Hawkweave IT Department"
         },
         {
           "name": "ConfiguredDate",
@@ -44,7 +44,7 @@
       "name": "Corporate Branding - User",
       "description": "User-level corporate identification (applied to all users)",
       "scope": "User",
-      "path": "SOFTWARE\\Contoso\\Corporate",
+      "path": "SOFTWARE\\Hawkweave\\Corporate",
       "action": "Set",
       "values": [
         {
@@ -64,7 +64,7 @@
       "name": "Corporate Branding - Default User",
       "description": "Applied to new user profiles when they first log in",
       "scope": "DefaultUser",
-      "path": "SOFTWARE\\Contoso\\Corporate",
+      "path": "SOFTWARE\\Hawkweave\\Corporate",
       "action": "Set",
       "values": [
         {

@@ -21,7 +21,7 @@
         {
           "name": "HomepageLocation",
           "type": "String",
-          "data": "https://intranet.contoso.com"
+          "data": "https://intranet.hawkweave.com"
         },
         {
           "name": "HomepageIsNewTabPage",
@@ -50,7 +50,7 @@
         {
           "name": "1",
           "type": "String",
-          "data": "https://intranet.contoso.com"
+          "data": "https://intranet.hawkweave.com"
         },
         {
           "name": "2",

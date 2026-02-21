@@ -16,7 +16,7 @@ The Registry Configuration Engine uses **JSON configuration files** to define re
 | Rollback | Not available | Transaction log with undo capability |
 | Default User Profile | Not supported | ✅ Applies to new user profiles |
 | Testing | Run detection first | Built-in `-WhatIf` validation |
-| Logging | Script output only | Windows Event Log + transcripts |
+| Logging | Script output only | Windows Event Log + file log (always on) |
 | Maintenance | Edit PowerShell | Edit JSON (no coding required) |
 
 ## 📁 Repository Structure
@@ -146,11 +146,17 @@ Get-ChildItem "$env:ProgramData\RegistryConfigEngine\Transactions\*.json"
 # Custom output location and prefix
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json" -OutputPath ".\Packages" -Prefix "CorporateBranding"
 
-# Enable Windows Event Log logging
-.\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json" -CreateEventLog
+# Enable detailed per-value logging
+.\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json" -VerboseLogging
 ```
 
-This creates self-contained `*-Detect.ps1` and `*-Remediate.ps1` files with the configuration embedded. Use `-CreateEventLog` to also write to the Windows Event Log (Application log, source: `RegistryConfigEngine`).
+This creates self-contained `*-Detect.ps1` and `*-Remediate.ps1` files with the configuration embedded. Generated scripts always log to both:
+- **Windows Event Log** (Application log, source: `RegistryConfigEngine`)
+- **File log** at `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log` (30-day retention)
+
+Use `-VerboseLogging` to include per-value details (each registry check/change with path, value name, expected vs current). Without it, scripts log only a summary per run.
+
+Generated scripts also auto-detect 32-bit PowerShell and relaunch via `SysNative` to ensure 64-bit registry access.
 
 **Option B: URL-Based Configuration (Advanced)**
 
@@ -336,9 +342,13 @@ After deployment, check compliance in Intune:
 - Look for output starting with `[REGENGINE]`
 
 Output examples:
-- ✅ `[REGENGINE] COMPLIANT - All settings are correct`
-- ⚠️ `[REGENGINE] NON-COMPLIANT - 3 setting(s) need remediation`
-- ✅ `[REGENGINE] SUCCESS - 3 change(s) applied`
+- `[REGENGINE] [OK] COMPLIANT - All settings are correct`
+- `[REGENGINE] [WARN] NON-COMPLIANT - 3 setting(s) need remediation`
+- `[REGENGINE] [OK] SUCCESS - 3 change(s) applied`
+
+On the device itself:
+- **Event Viewer** → **Application** → Source: `RegistryConfigEngine`
+- **File log**: `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log`
 
 ## 🔒 Security Considerations
 
@@ -397,10 +407,13 @@ Run with verbose output:
 .\Invoke-RegistryConfigEngine.ps1 -ConfigPath ".\config.json" -Mode Detect -Verbose
 ```
 
-### Event Log
+### Logging
 
-If `-CreateEventLog` is specified, check:
+Generated scripts always log to both Windows Event Log and file. Check:
 - **Event Viewer** → **Application** → Source: `RegistryConfigEngine`
+- **File log**: `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log`
+
+File logs are automatically pruned after 30 days. Use `-VerboseLogging` when packaging to include per-value detail in both log destinations.
 
 ## 📝 Sample Configurations
 
