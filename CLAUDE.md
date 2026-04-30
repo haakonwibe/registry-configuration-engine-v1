@@ -34,8 +34,21 @@ Registry Configuration Engine for Microsoft Intune - a PowerShell-based tool tha
 # Custom output location and prefix
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\config.json" -OutputPath ".\Packages" -Prefix "CompanySettings"
 
-# Enable detailed per-value logging in generated scripts
+# Inject $VerbosePreference = 'Continue' into the generated scripts
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\config.json" -VerboseLogging
+```
+
+### Running tests
+```powershell
+# One-time setup
+Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+
+# Run Pester
+Invoke-Pester -Path .\tests
+
+# Run analyzer
+Invoke-ScriptAnalyzer -Path .\Invoke-RegistryConfigEngine.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
 ```
 
 ### Creating Configurations from Registry Exports
@@ -63,7 +76,7 @@ regedit /e "C:\temp\settings.reg" "HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsof
 - `Validate` - Parse and validate JSON without registry access
 - `Rollback` - Restore previous values from transaction log
 
-**New-IntunePackage.ps1**: Packages JSON config into self-contained Intune scripts by embedding both the configuration and a minified engine. Generated scripts always log to Windows Event Log and file log (`C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log` with 30-day retention). Use `-VerboseLogging` for per-value detail. Scripts auto-detect 32-bit PowerShell and relaunch via SysNative for 64-bit registry access.
+**New-IntunePackage.ps1**: Reads the sibling `Invoke-RegistryConfigEngine.ps1` and produces two self-contained scripts (`<Prefix>-Detect.ps1`, `<Prefix>-Remediate.ps1`) by replacing the engine's `INJECTION_POINT` region with the embedded config (here-string), `$script:__ForcedMode`, and `$script:__ForcedEventLog = $true`. The engine is the single source of truth — there is no separate template. Generated scripts pin to the engine version they were built against. `-VerboseLogging` injects `$VerbosePreference = 'Continue'` (standard PS mechanism, not a custom flag).
 
 **ConvertFrom-RegistryExport.ps1**: Converts Windows Registry export (.reg) files to JSON configuration format. Supports all registry value types and automatically maps HKLM→Machine, HKCU→User scopes.
 
@@ -72,7 +85,7 @@ regedit /e "C:\temp\settings.reg" "HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsof
 | Scope | Target | Registry Location |
 |-------|--------|-------------------|
 | `Machine` | Machine-wide | HKLM:\ |
-| `User` | All existing users | HKU enumeration (S-1-5-21-* and S-1-12-1-* SIDs) |
+| `User` | All profiles in `HKLM\...\ProfileList` (S-1-5-21-* and S-1-12-1-* SIDs). Already-mounted hives are used as-is; signed-out profiles have their `NTUSER.DAT` `reg.exe load`ed into a temp key for the duration of the run. | HKU\<SID> (signed in) or HKU\RegEngineTemp_<PID>_<rand> (mounted by engine) |
 | `DefaultUser` | New user template | C:\Users\Default\NTUSER.DAT (loaded temporarily) |
 
 ### JSON Configuration Structure
@@ -100,6 +113,7 @@ Setting options:
 Value options:
 - `skipDetection` (optional, default: false) - When true, the value is written during remediation but not checked during detection. Useful for timestamp values like `{{DATETIME}}` that change on each run.
 - `comparison` (optional, default: "Equals") - Comparison operator for detection. Remediation always sets the `data` value (except `NotExists` which deletes).
+- `caseSensitive` (optional, default: false) - When true, string-typed comparisons (`Equals`, `NotEquals`, `Contains`, `StartsWith`, `EndsWith`) use ordinal case-sensitive matching. Applies to `String`, `ExpandString`, and `MultiString`.
 
 ### Comparison Operators
 
@@ -123,7 +137,12 @@ Variables expanded at runtime in string values: `{{DATE}}`, `{{DATETIME}}`, `{{C
 
 ### Transaction Logging & Rollback
 
-Changes are logged to `C:\ProgramData\RegistryConfigEngine\Transactions\` for rollback capability.
+Changes are logged to `C:\ProgramData\RegistryConfigEngine\Transactions\Transaction_yyyyMMdd_HHmmss_fff_<PID>.json`. The millisecond+PID suffix prevents filename collisions when runs overlap (parallel CI, rapid iteration).
+
+For `DeleteKey` actions, the engine writes a `.reg` export under `KeyBackups\` before deletion and records the path in the transaction (`BackupFile` plus `BackupKind` of `Machine`, `MountedUser`, or `TempMount`). Rollback for `Type=Key`:
+- `Machine` → `reg.exe import` restores the key.
+- `MountedUser` → import restores the key if the same user is mounted at rollback time (otherwise the import has no durable target).
+- `TempMount` (DefaultUser, or a User profile the engine mounted itself) → not auto-restored. The backup file is retained for manual recovery.
 
 **Note:** Rollback is designed for **local development and testing**, not production use. Use it to:
 - Test configurations before deploying to Intune
@@ -149,12 +168,18 @@ Get-ChildItem "$env:ProgramData\RegistryConfigEngine\Transactions\*.json"
 
 ## Key Implementation Details
 
-- User profiles enumerated from HKU support both AD SIDs (S-1-5-21-*) and Entra ID SIDs (S-1-12-1-*)
-- DefaultUser hive loaded via `reg.exe load` with garbage collection before unload to release handles
-- Binary values accept comma-separated hex (`"3C,00,00,00"`), hex string (`"3C000000"`), or array (`[60, 0, 0, 0]`)
+- User profiles enumerated from `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`, supporting both AD SIDs (S-1-5-21-*) and Entra ID SIDs (S-1-12-1-*). Already-mounted hives in HKU are used as-is; signed-out profiles have NTUSER.DAT loaded into a temp key (`HKU\RegEngineTemp_<PID>_<rand>`) and unloaded after iteration.
+- DefaultUser and engine-mounted user hives use the same temp prefix and same `Mount-UserHive` / `Dismount-RegistryHive` helpers, with garbage collection before unload to release handles.
+- At startup (Detect/Remediate modes), `Remove-OrphanedTempHives` scans HKU for `DefaultUserTemp_*` and `RegEngineTemp_*` keys whose owner PID is no longer running and unloads them. Mounts whose owner PID is still alive are left alone to avoid clobbering concurrent runs.
+- URL configs are restricted to `https://`, downloaded with a 30-second timeout, zero redirects, and may be verified against an expected SHA-256 via the `-ConfigSha256` parameter (mismatch aborts the run).
+- Binary values accept comma-separated hex (`"3C,00,00,00"`), continuous hex string with even length (`"3C000000"`), or array (`[60, 0, 0, 0]`). The parser branches on comma presence first, then falls through to hex-string handling.
+- String / ExpandString / MultiString comparisons default to ordinal case-insensitive. Set `caseSensitive: true` on the value to switch to ordinal case-sensitive (uses `[string]::Equals(..., 'Ordinal')` and `String.Contains/StartsWith/EndsWith`).
+- `Expand-ConfigVariables` walks arrays of strings (so MultiString elements get variable expansion) but leaves non-string arrays (binary as `byte[]`) untouched.
 - Scripts designed to run as SYSTEM through Intune (no logged-on user dependency)
 - All scripts require PowerShell 5.1+ (compatible with Intune Remediations which use Windows PowerShell)
 - Packaged scripts auto-relaunch in 64-bit PowerShell if started in 32-bit (via `$env:SystemRoot\SysNative`)
 - Logging is always on in packaged scripts: Windows Event Log (Application/RegistryConfigEngine) + file log with 30-day retention
 - `NotExists` comparison: detection checks value is absent; remediation deletes the value (instead of trying to set it)
-- `skipDetection` and all comparison operators are fully supported in the packaged template (not just the main engine)
+- All engine features — `skipDetection`, comparison operators, `caseSensitive`, ProfileList enumeration, URL hardening (irrelevant to packaged scripts since their config is embedded), `DeleteKey` reg-export backup — are automatically present in generated packages because the generator inlines the engine itself. There is no template drift to manage.
+- The engine is dot-source-safe: a guard around the Main Execution block (`if ($MyInvocation.InvocationName -ne '.')`) lets Pester load the engine and test its functions without triggering execution. Tests live in `tests/Engine.Tests.ps1` and run on CI alongside PSScriptAnalyzer.
+- Reboot toast (`Show-RebootToast`) registers a scheduled task running as the local Users group. Reliable for single-user laptops; on multi-session hosts (RDS, AVD pooled, Windows 365 multi-session) it runs for whichever Users-group member the scheduler picks — treat as best-effort there.

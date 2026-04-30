@@ -330,7 +330,6 @@ foreach ($key in $settings.Keys | Sort-Object) {
 }
 
 # Create final JSON structure with metadata
-$inputFileName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
 $output = [ordered]@{
     '$schema'    = 'https://alttabtowork.com/schemas/registry-config-v1.json'
     version      = '1.0'

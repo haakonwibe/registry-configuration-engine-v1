@@ -130,8 +130,17 @@ All changes are logged to `C:\ProgramData\RegistryConfigEngine\Transactions\`. U
 Get-ChildItem "$env:ProgramData\RegistryConfigEngine\Transactions\*.json"
 
 # Rollback a specific remediation
-.\Invoke-RegistryConfigEngine.ps1 -ConfigPath "C:\ProgramData\RegistryConfigEngine\Transactions\Transaction_20260129_143000.json" -Mode Rollback
+.\Invoke-RegistryConfigEngine.ps1 -ConfigPath "C:\ProgramData\RegistryConfigEngine\Transactions\Transaction_20260129_143000_512_4321.json" -Mode Rollback
 ```
+
+For `DeleteKey` actions, the engine writes a `.reg` export under `C:\ProgramData\RegistryConfigEngine\Transactions\KeyBackups\` before deletion. The transaction log records its path so rollback can `reg.exe import` it.
+
+| Scope of `DeleteKey` | Auto-restore on rollback |
+|----------------------|--------------------------|
+| `Machine` | ✅ Fully restored |
+| `User` (signed in at remediation time) | ✅ Restored when the same user is signed in at rollback time |
+| `User` (signed out — engine mounted the hive) | ⚠️ Not auto-restored. Backup file is retained for manual recovery. |
+| `DefaultUser` | ⚠️ Not auto-restored. Backup file is retained for manual recovery. |
 
 > **Note:** Rollback is intended for local development and testing. For production, create a reverse configuration (using `Delete` action or restoring default values) and deploy it as a new Intune remediation.
 
@@ -146,17 +155,17 @@ Get-ChildItem "$env:ProgramData\RegistryConfigEngine\Transactions\*.json"
 # Custom output location and prefix
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json" -OutputPath ".\Packages" -Prefix "CorporateBranding"
 
-# Enable detailed per-value logging
+# Enable verbose logging in the generated scripts
 .\New-IntunePackage.ps1 -ConfigPath ".\Configs\01-corporate-branding.json" -VerboseLogging
 ```
 
-This creates self-contained `*-Detect.ps1` and `*-Remediate.ps1` files with the configuration embedded. Generated scripts always log to both:
+The generator produces `<Prefix>-Detect.ps1` and `<Prefix>-Remediate.ps1` by reading the engine itself and embedding the config + forced mode into the engine's `INJECTION_POINT` region. There is no separate template — the engine is the single source of truth. Generated scripts pin to the engine version they were built against; regenerate to pick up engine changes.
+
+Generated scripts always log to:
 - **Windows Event Log** (Application log, source: `RegistryConfigEngine`)
 - **File log** at `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log` (30-day retention)
 
-Use `-VerboseLogging` to include per-value details (each registry check/change with path, value name, expected vs current). Without it, scripts log only a summary per run.
-
-Generated scripts also auto-detect 32-bit PowerShell and relaunch via `SysNative` to ensure 64-bit registry access.
+`-VerboseLogging` injects `$VerbosePreference = 'Continue'` into the generated script, surfacing every Write-Verbose / Debug-level line the engine emits (per-value detection results, hive mount/unmount messages, etc.). It uses the standard PowerShell mechanism — there is no custom flag inside the script.
 
 **Option B: URL-Based Configuration (Advanced)**
 
@@ -169,6 +178,18 @@ The engine supports loading configurations from URLs:
 1. Host your JSON on a web server or Azure Blob Storage (with public access or SAS token)
 2. Point the script to the URL
 3. Centrally update configurations without redeploying scripts
+
+**Security:**
+- Only `https://` URLs are accepted; plain HTTP is rejected.
+- The download has a 30-second timeout and follows zero redirects.
+- Pass `-ConfigSha256 <hex>` to require an exact SHA-256 of the downloaded bytes before parsing. The run aborts on mismatch. Recommended for any URL-based deployment running as SYSTEM:
+
+```powershell
+.\Invoke-RegistryConfigEngine.ps1 `
+    -ConfigPath "https://example.com/configs/my-config.json" `
+    -ConfigSha256 "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" `
+    -Mode Detect
+```
 
 > **Note:** Ensure the URL is accessible from managed devices. Azure Blob Storage with SAS tokens works well for this scenario.
 
@@ -211,8 +232,10 @@ The engine supports loading configurations from URLs:
 | Scope | Description | Registry Location |
 |-------|-------------|-------------------|
 | `Machine` | Machine-wide settings | `HKLM:\` |
-| `User` | All existing user profiles | `HKU:\<SID>\` (enumerated) |
+| `User` | All user profiles registered with Windows | `HKU:\<SID>\` for signed-in users; for signed-out profiles the engine loads `NTUSER.DAT` from the profile path enumerated via `HKLM\...\ProfileList` |
 | `DefaultUser` | Template for new users | `C:\Users\Default\NTUSER.DAT` |
+
+> **Note:** Loaded user hives stay locked while a user is signed in. The engine enumerates `ProfileList` to include signed-out profiles too, but profiles whose `NTUSER.DAT` is locked by another process at the time of the run are silently skipped (logged at Debug level).
 
 ### Actions
 
@@ -231,7 +254,7 @@ The engine supports loading configurations from URLs:
 | `scope` | string | (required) | Target scope (see Scopes above) |
 | `path` | string | (required) | Registry path (without hive prefix) |
 | `action` | string | (required) | Action to perform (see Actions above) |
-| `rebootRequired` | bool | `false` | Show a toast notification to the user after remediation indicating a reboot is needed |
+| `rebootRequired` | bool | `false` | Show a toast notification to the user after remediation indicating a reboot is needed. **Multi-session note:** the toast runs as a member of the local Users group via Task Scheduler, so on RDS / multi-session hosts (e.g., Windows 365 multi-session, AVD pooled) it may appear for whichever user the task lands on rather than every signed-in user. Reliable for single-user laptops; treat as best-effort elsewhere. |
 | `values` | array | (required) | Array of registry values to set/delete |
 
 ### Value Types
@@ -253,6 +276,7 @@ The engine supports loading configurations from URLs:
 | `type` | string | (required*) | Registry value type (see above). *Not required for `NotExists` comparison. |
 | `data` | varies | (required*) | Value to set. *Not required for `Exists` or `NotExists` comparison. |
 | `comparison` | string | `Equals` | Comparison operator for detection (see below) |
+| `caseSensitive` | bool | `false` | When `true`, string comparisons (`Equals`, `NotEquals`, `Contains`, `StartsWith`, `EndsWith`) use ordinal case-sensitive matching. Applies to `String`, `ExpandString`, and `MultiString` types. |
 | `skipDetection` | bool | `false` | Skip this value during detection. Useful for timestamps like `{{DATETIME}}` that change on each run. |
 
 ### Comparison Operators
@@ -291,7 +315,7 @@ Use these placeholders in string values - they're expanded at runtime:
 | `{{USERNAME}}` | Current username | `jsmith` |
 | `{{DOMAIN}}` | Domain/workgroup | `CONTOSO` |
 | `{{OSVERSION}}` | Windows version | `10.0.22631.0` |
-| `{{ENGINEVERSION}}` | Script version | `1.0.0` |
+| `{{ENGINEVERSION}}` | Script version | `1.1.0` |
 
 > **Tip**: For values using `{{DATETIME}}`, add `"skipDetection": true` to prevent false non-compliance reports. Since the time changes each run, the value written during remediation will never match the expected value during detection.
 
@@ -318,6 +342,16 @@ Output examples:
 On the device itself:
 - **Event Viewer** → **Application** → Source: `RegistryConfigEngine`
 - **File log**: `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log`
+
+## 📝 Logging
+
+The engine writes to three sinks. Every line is tagged with a config identifier (filename for file/URL configs, sanitised `description` for embedded configs) so multiple deployments running on the same machine are distinguishable.
+
+**Standard output (stdout)** — what Intune captures and shows in the Devices → Monitor → Remediations view. Always on. The final summary line that drives the exit code is the most important record here. Format: `[REGENGINE] [<config-id>] <status> - <details>`.
+
+**File log** — `C:\ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log`. Always on, append-only, hardcoded path. Each line is `<ISO-8601 UTC timestamp> [<level>] [REGENGINE] [<config-id>] <message>`. Useful for cross-run troubleshooting because it survives Intune's per-run output truncation and aggregates every emitted line, not just the final summary. **No rotation** — the file grows over time. Admins can manage it externally (rotate, archive, or delete) without affecting the engine; if it can't be written, the engine logs a Verbose line and continues. Non-elevated standalone runs may not have permission to write to this path; that's expected.
+
+**Windows Event Log** — Application log, source `RegistryConfigEngine`. Opt-in via `-CreateEventLog` (or always-on in scripts produced by `New-IntunePackage.ps1`) and only emitted when the engine is running elevated. The event message is the same tagged line written to the file log. A single source serves every deployment; the config identifier in the message body distinguishes them.
 
 ## 🔒 Security Considerations
 
@@ -366,7 +400,7 @@ This ensures compatibility with:
 - Another process may have the hive locked
 
 **Binary values not matching**
-- Verify hex format: comma-separated (e.g., `"3C,00,00,00"`)
+- Verify hex format: comma-separated (e.g., `"3C,00,00,00"`), continuous hex string (`"3C000000"`, even length required), or numeric array (`[60, 0, 0, 0]`)
 - Check for leading/trailing whitespace
 
 ### Debug Mode

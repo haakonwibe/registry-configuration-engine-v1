@@ -90,9 +90,14 @@
             
             <!-- Header -->
             <div class="text-center mb-16">
-                <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full glass mb-6">
-                    <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-                    <span class="text-sm text-gray-300">Open Source • MIT License</span>
+                <div class="inline-flex flex-wrap justify-center items-center gap-3 mb-6">
+                    <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full glass">
+                        <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                        <span class="text-sm text-gray-300">Open Source • MIT License</span>
+                    </div>
+                    <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full glass">
+                        <span class="text-sm mono font-semibold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">v1.1.0</span>
+                    </div>
                 </div>
                 
                 <h1 class="text-6xl font-black mb-4 tracking-tight">
@@ -197,7 +202,7 @@
                             </svg>
                         </div>
                         <h3 class="text-lg font-semibold mb-2">All User Profiles</h3>
-                        <p class="text-gray-400 text-sm">Apply to existing users, new users via DefaultUser hive, and supports both AD and Entra ID SIDs.</p>
+                        <p class="text-gray-400 text-sm">Reaches every profile registered with Windows. Signed-out users get their <span class="mono">NTUSER.DAT</span> loaded on demand. AD and Entra ID SIDs both supported, plus the DefaultUser template for new accounts.</p>
                     </div>
                     
                     <!-- Feature 3 -->
@@ -241,7 +246,29 @@
                             </svg>
                         </div>
                         <h3 class="text-lg font-semibold mb-2">Self-Contained Packages</h3>
-                        <p class="text-gray-400 text-sm">New-IntunePackage.ps1 embeds config + engine into standalone detect/remediate scripts.</p>
+                        <p class="text-gray-400 text-sm">New-IntunePackage.ps1 embeds the engine + config into standalone Detect/Remediate scripts via an INJECTION_POINT region. One source of truth — engine fixes propagate automatically.</p>
+                    </div>
+
+                    <!-- Feature 7: Tagged Logging (v1.1.0) -->
+                    <div class="feature-card rounded-2xl p-6">
+                        <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-teal-500/20 to-emerald-500/20 flex items-center justify-center mb-4">
+                            <svg class="w-6 h-6 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/>
+                            </svg>
+                        </div>
+                        <h3 class="text-lg font-semibold mb-2">Tagged Logging</h3>
+                        <p class="text-gray-400 text-sm">Every line in stdout, the file log, and Event Log carries the active config identifier. Concurrent deployments stay distinguishable in shared sinks like Event Viewer.</p>
+                    </div>
+
+                    <!-- Feature 8: Hardened URL Configs (v1.1.0) -->
+                    <div class="feature-card rounded-2xl p-6">
+                        <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-violet-500/20 flex items-center justify-center mb-4">
+                            <svg class="w-6 h-6 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+                            </svg>
+                        </div>
+                        <h3 class="text-lg font-semibold mb-2">Hardened URL Configs</h3>
+                        <p class="text-gray-400 text-sm">HTTPS-only URL loading with timeouts, zero redirects, and optional <span class="mono">-ConfigSha256</span> integrity verification. Hardened against supply-chain tampering when running as SYSTEM.</p>
                     </div>
                 </div>
             </div>

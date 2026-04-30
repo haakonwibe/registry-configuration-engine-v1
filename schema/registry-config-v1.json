@@ -132,6 +132,11 @@
           "enum": ["Equals", "NotEquals", "GreaterThan", "GreaterThanOrEqual", "LessThan", "LessThanOrEqual", "Contains", "StartsWith", "EndsWith", "Exists", "NotExists"],
           "default": "Equals",
           "description": "Comparison operator for detection. Equals (default) = exact match. Numeric operators (GreaterThan, etc.) for DWord/QWord. String operators (Contains, StartsWith, EndsWith) for String. Exists/NotExists check presence. Remediation always sets the data value, except NotExists which deletes."
+        },
+        "caseSensitive": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, string-typed comparisons (Equals, NotEquals, Contains, StartsWith, EndsWith) use ordinal case-sensitive matching. Applies to String, ExpandString, and MultiString types. Defaults to ordinal case-insensitive."
         }
       },
       "if": {

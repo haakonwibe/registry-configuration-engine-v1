@@ -56,7 +56,7 @@
 .NOTES
     Author:         Haakon Wibe
     Blog:           https://alttabtowork.com
-    Version:        1.0.0
+    Version:        1.1.0
     Creation Date:  2026-01-28
     
     Inspired by the community's work on registry management, particularly Martin Bengtsson's
@@ -82,14 +82,38 @@ param(
     [string]$TransactionLogPath = "$env:ProgramData\RegistryConfigEngine\Transactions",
 
     [Parameter()]
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string]$ConfigSha256,
+
+    [Parameter()]
     [switch]$CreateEventLog
 )
 
+#region INJECTION_POINT
+# Replaced by New-IntunePackage.ps1 during generation. Leave as-is for standalone use.
+$script:__EmbeddedConfig = $null
+$script:__ForcedMode     = $null
+$script:__ForcedEventLog = $false
+#endregion
+
 #region Script Configuration
-$script:EngineVersion = "1.0.0"
+$script:EngineVersion = "1.1.0"
 $script:EventLogSource = "RegistryConfigEngine"
 $script:EventLogName = "Application"
 $script:LogPrefix = "[REGENGINE]"
+# Identifier of the active configuration. Populated in Main after config load
+# from the file/URL filename or the embedded config description. Used by
+# Write-Log to tag every emitted line so concurrent deployments are
+# distinguishable in Event Viewer (which has one shared source).
+$script:ConfigIdentifier = "unknown"
+# File log destination. Always-on, non-elevated runs may fail to write — that's
+# logged as Verbose and otherwise ignored. Hardcoded; matches existing docs and
+# the old packaged-template behavior.
+$script:LogFilePath = "$env:ProgramData\RegistryConfigEngine\Logs\RegistryConfigEngine.log"
+
+# Prefix for temp-mounted hives. Encodes our PID so concurrent runs don't unload
+# each other's mounts during orphan cleanup.
+$script:TempHivePrefix = "RegEngineTemp_${PID}_"
 
 # Exit codes for Intune Remediations
 $script:ExitCodes = @{
@@ -128,16 +152,35 @@ function Write-Log {
         'Success' { "[OK]" }
         'Debug'   { "[DEBUG]" }
     }
-    
-    $logMessage = "$timestamp $script:LogPrefix $prefix $Message"
-    
+
+    # Tag every emission with the active config identifier so concurrent
+    # deployments are distinguishable in Event Viewer (which uses a single
+    # shared source). Done on a local copy so the $Message parameter is untouched.
+    $taggedMessage = "[$script:ConfigIdentifier] $Message"
+    $logMessage = "$timestamp $script:LogPrefix $prefix $taggedMessage"
+
     switch ($Level) {
         'Error'   { Write-Error $logMessage }
         'Warning' { Write-Warning $logMessage }
         'Debug'   { Write-Verbose $logMessage }
         default   { Write-Output $logMessage }
     }
-    
+
+    # Always-on file log. ISO-8601 UTC timestamp + level + LogPrefix + tagged message.
+    # Failures are non-fatal: a Verbose line is emitted and execution continues.
+    try {
+        $logDir = Split-Path -Parent $script:LogFilePath
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $utcStamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        $fileLine = "$utcStamp $prefix $script:LogPrefix $taggedMessage"
+        Add-Content -Path $script:LogFilePath -Value $fileLine -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Verbose "File log write failed: $_"
+    }
+
     # Write to Event Log if requested and running elevated
     if ($CreateEventLog -and ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         try {
@@ -145,15 +188,15 @@ function Write-Log {
             if (-not [System.Diagnostics.EventLog]::SourceExists($script:EventLogSource)) {
                 New-EventLog -LogName $script:EventLogName -Source $script:EventLogSource -ErrorAction SilentlyContinue
             }
-            
+
             $entryType = switch ($Level) {
                 'Error'   { 'Error' }
                 'Warning' { 'Warning' }
                 default   { 'Information' }
             }
-            
+
             Write-EventLog -LogName $script:EventLogName -Source $script:EventLogSource `
-                -EventId $EventId -EntryType $entryType -Message $Message
+                -EventId $EventId -EntryType $entryType -Message $taggedMessage
         }
         catch {
             Write-Verbose "Could not write to Event Log: $_"
@@ -246,48 +289,139 @@ catch {
     }
 }
 
+function Mount-UserHive {
+    <#
+    .SYNOPSIS
+        Loads a user's NTUSER.DAT into HKU under a temporary key.
+    .DESCRIPTION
+        Used for both signed-out user profiles and the Default User template.
+        Returns $null if the file is missing or the load fails (e.g., locked).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProfileImagePath,
+
+        [Parameter()]
+        [string]$Username = "Unknown"
+    )
+
+    $ntuserPath = Join-Path $ProfileImagePath 'NTUSER.DAT'
+    # Some profile paths (other users') deny read access from non-SYSTEM contexts —
+    # treat both "missing" and "access denied" as "skip this profile".
+    $ntuserExists = $false
+    try {
+        $ntuserExists = Test-Path -LiteralPath $ntuserPath -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Cannot access $ntuserPath ($Username): $_" -Level Debug
+        return $null
+    }
+    if (-not $ntuserExists) {
+        Write-Log "NTUSER.DAT not found at: $ntuserPath" -Level Debug
+        return $null
+    }
+
+    $rand = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $tempKey = "HKU\$($script:TempHivePrefix)$rand"
+
+    try {
+        $regLoad = & reg.exe load $tempKey $ntuserPath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # Most common cause: NTUSER.DAT is locked because the user is signed in
+            # but their hive isn't visible in HKU yet (rare timing window), or another
+            # process holds it open.
+            Write-Log "Could not load hive for ${Username}: $regLoad" -Level Debug
+            return $null
+        }
+        Write-Log "Mounted hive ($Username) at: $tempKey" -Level Debug
+        return [PSCustomObject]@{
+            HivePath    = "Registry::$tempKey"
+            TempKey     = $tempKey
+            NeedsUnload = $true
+        }
+    }
+    catch {
+        Write-Log "Exception mounting hive ($Username): $_" -Level Debug
+        return $null
+    }
+}
+
 function Get-UserProfileSIDs {
     <#
     .SYNOPSIS
-        Gets all user profile SIDs from the registry, supporting both AD and Entra ID joined devices.
+        Returns all user profiles known to Windows, mounting NTUSER.DAT for any
+        whose hive is not currently loaded in HKU.
+    .DESCRIPTION
+        Enumerates HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
+        rather than HKU directly, so signed-out users are included. For each
+        profile:
+          - If the SID is already mounted in HKU (signed in), use that path with
+            HiveInfo=$null so callers do not unload it.
+          - Otherwise, attempt reg.exe load of NTUSER.DAT into a temp key. The
+            caller is responsible for unloading via Dismount-RegistryHive.
+        Supports both AD (S-1-5-21-*) and Entra ID (S-1-12-1-*) SIDs.
     #>
     [CmdletBinding()]
     param()
-    
+
     $userSIDs = @()
-    
+
     try {
-        # Get all SIDs from HKU (mounted user hives)
-        $hkuKeys = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | 
-            Where-Object { $_.PSChildName -match '^S-1-5-21-|^S-1-12-1-' } |
-            Where-Object { $_.PSChildName -notmatch '_Classes$' }
-        
-        foreach ($key in $hkuKeys) {
-            $sid = $key.PSChildName
-            
-            # Try to get the username for logging purposes
+        # Snapshot SIDs currently mounted in HKU (signed-in users + anything else
+        # that already holds the hive open). We must not try to reg.exe load these.
+        $loadedSIDs = @{}
+        Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^(S-1-5-21-|S-1-12-1-)' -and $_.PSChildName -notmatch '_Classes$' } |
+            ForEach-Object { $loadedSIDs[$_.PSChildName] = $true }
+
+        # Enumerate every profile registered with Windows
+        $profileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+        $profileKeys = Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^(S-1-5-21-|S-1-12-1-)' }
+
+        foreach ($profileKey in $profileKeys) {
+            $sid = $profileKey.PSChildName
+            $profileImagePath = (Get-ItemProperty -Path $profileKey.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+            if (-not $profileImagePath) { continue }
+
             try {
                 $objSID = New-Object System.Security.Principal.SecurityIdentifier($sid)
-                $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
-                $username = $objUser.Value
+                $username = $objSID.Translate([System.Security.Principal.NTAccount]).Value
             }
             catch {
-                $username = "Unknown"
+                $username = $sid
             }
-            
-            $userSIDs += [PSCustomObject]@{
-                SID      = $sid
-                Username = $username
-                HivePath = "Registry::HKEY_USERS\$sid"
+
+            if ($loadedSIDs.ContainsKey($sid)) {
+                $userSIDs += [PSCustomObject]@{
+                    SID      = $sid
+                    Username = $username
+                    HivePath = "Registry::HKEY_USERS\$sid"
+                    HiveInfo = $null
+                }
+            }
+            else {
+                $hive = Mount-UserHive -ProfileImagePath $profileImagePath -Username $username
+                if (-not $hive) {
+                    Write-Log "Skipped profile $username ($sid): hive could not be mounted" -Level Debug
+                    continue
+                }
+                $userSIDs += [PSCustomObject]@{
+                    SID      = $sid
+                    Username = $username
+                    HivePath = $hive.HivePath
+                    HiveInfo = $hive
+                }
             }
         }
-        
-        Write-Log "Found $($userSIDs.Count) user profile(s) in HKU" -Level Debug
+
+        Write-Log "Found $($userSIDs.Count) user profile(s) (loaded + on-disk via ProfileList)" -Level Debug
     }
     catch {
         Write-Log "Error enumerating user SIDs: $_" -Level Error
     }
-    
+
     return $userSIDs
 }
 
@@ -298,64 +432,89 @@ function Get-DefaultUserHive {
     #>
     [CmdletBinding()]
     param()
-    
-    $defaultUserPath = "$env:SystemDrive\Users\Default\NTUSER.DAT"
-    $tempHiveKey = "HKU\DefaultUserTemp_$(Get-Random)"
-    
-    if (-not (Test-Path $defaultUserPath)) {
-        Write-Log "Default user hive not found at: $defaultUserPath" -Level Warning
-        return $null
+
+    $defaultUserDir = "$env:SystemDrive\Users\Default"
+    $hive = Mount-UserHive -ProfileImagePath $defaultUserDir -Username 'Default User'
+    if (-not $hive) {
+        Write-Log "Default user hive not available at: $defaultUserDir" -Level Warning
     }
-    
-    try {
-        # Load the hive
-        $regLoad = & reg.exe load $tempHiveKey $defaultUserPath 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Failed to load default user hive: $regLoad" -Level Error
-            return $null
-        }
-        
-        Write-Log "Loaded Default User hive to: $tempHiveKey" -Level Debug
-        
-        return [PSCustomObject]@{
-            HivePath    = "Registry::$tempHiveKey"
-            TempKey     = $tempHiveKey
-            NeedsUnload = $true
-        }
-    }
-    catch {
-        Write-Log "Exception loading default user hive: $_" -Level Error
-        return $null
-    }
+    return $hive
 }
 
-function Dismount-DefaultUserHive {
+function Dismount-RegistryHive {
     <#
     .SYNOPSIS
-        Dismounts a previously loaded Default User hive.
+        Dismounts a previously loaded user/default hive.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$TempKey
     )
-    
+
     try {
-        # Force garbage collection to release any handles
+        # Force garbage collection to release any handles into the hive
         [gc]::Collect()
         [gc]::WaitForPendingFinalizers()
         Start-Sleep -Milliseconds 500
-        
+
         $regUnload = & reg.exe unload $TempKey 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Log "Warning: Could not dismount hive (may still be in use): $regUnload" -Level Warning
         }
         else {
-            Write-Log "Dismounted Default User hive: $TempKey" -Level Debug
+            Write-Log "Dismounted hive: $TempKey" -Level Debug
         }
     }
     catch {
         Write-Log "Exception dismounting hive: $_" -Level Warning
+    }
+}
+
+function Remove-OrphanedTempHives {
+    <#
+    .SYNOPSIS
+        Unloads any temp hives left behind by previous (crashed) runs.
+    .DESCRIPTION
+        Scans HKU for keys matching the engine's temp-hive prefix (current and
+        legacy). Keys belonging to the current PID are skipped. Keys whose
+        encoded PID is still alive are left alone (concurrent run). Anything
+        else is attempted; reg.exe unload naturally refuses if a hive is in use,
+        so attempt-and-ignore is safe.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $hkuKeys = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^(DefaultUserTemp_|RegEngineTemp_)' }
+
+        foreach ($key in $hkuKeys) {
+            $name = $key.PSChildName
+
+            # Never touch our own active mounts
+            if ($name -like "$($script:TempHivePrefix)*") { continue }
+
+            # Respect concurrent runs of this engine
+            if ($name -match '^RegEngineTemp_(\d+)_') {
+                $ownerPid = [int]$Matches[1]
+                if (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) {
+                    Write-Log "Skipping HKU\$name (owner PID $ownerPid still running)" -Level Debug
+                    continue
+                }
+            }
+
+            $null = & reg.exe unload "HKU\$name" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "Cleaned up orphan hive: HKU\$name" -Level Info
+            }
+            else {
+                Write-Log "Could not unload orphan HKU\$name (likely in use)" -Level Debug
+            }
+        }
+    }
+    catch {
+        Write-Log "Orphan hive cleanup error: $_" -Level Debug
     }
 }
 
@@ -391,14 +550,21 @@ function Convert-RegistryValue {
             if ($Value -is [array]) {
                 return [byte[]]$Value
             }
-            elseif ($Value -match '^[0-9A-Fa-f,\s]+$') {
-                # Comma-separated or space-separated hex values
-                $cleanValue = $Value -replace '\s+', ',' -replace ',+', ','
+            $stringValue = [string]$Value
+            if ($stringValue.Contains(',')) {
+                # Comma-separated hex bytes (with optional whitespace)
+                if ($stringValue -notmatch '^[0-9A-Fa-f,\s]+$') {
+                    throw "Invalid binary value format (comma-separated hex expected): $Value"
+                }
+                $cleanValue = $stringValue -replace '\s+', ',' -replace ',+', ','
                 return [byte[]]($cleanValue -split ',' | Where-Object { $_ } | ForEach-Object { [Convert]::ToByte($_.Trim(), 16) })
             }
-            elseif ($Value -match '^(0x)?[0-9A-Fa-f]+$') {
+            elseif ($stringValue -match '^(0x)?[0-9A-Fa-f]+$') {
                 # Single hex string
-                $hexString = $Value -replace '^0x', ''
+                $hexString = $stringValue -replace '^0x', ''
+                if ($hexString.Length % 2 -ne 0) {
+                    throw "Invalid binary hex string (must have even length): $Value"
+                }
                 $bytes = for ($i = 0; $i -lt $hexString.Length; $i += 2) {
                     [Convert]::ToByte($hexString.Substring($i, 2), 16)
                 }
@@ -409,11 +575,13 @@ function Convert-RegistryValue {
             }
         }
         'multistring' {
+            # Comma operator wraps the array so the pipeline doesn't enumerate it
+            # away — preserves the [string[]] type for the caller.
             if ($Value -is [array]) {
-                return [string[]]$Value
+                return ,[string[]]$Value
             }
             else {
-                return [string[]]@($Value)
+                return ,[string[]]@($Value)
             }
         }
         default {
@@ -457,7 +625,7 @@ function Expand-ConfigVariables {
     
     if ($Value -is [string]) {
         $expanded = $Value
-        
+
         # Built-in variables
         $variables = @{
             '{{DATE}}'         = (Get-Date -Format "yyyy-MM-dd")
@@ -468,14 +636,29 @@ function Expand-ConfigVariables {
             '{{OSVERSION}}'    = [System.Environment]::OSVersion.Version.ToString()
             '{{ENGINEVERSION}}' = $script:EngineVersion
         }
-        
+
         foreach ($var in $variables.Keys) {
             $expanded = $expanded -replace [regex]::Escape($var), $variables[$var]
         }
-        
+
         return $expanded
     }
-    
+
+    # Walk arrays of strings (multistring). Leave non-string arrays (binary as
+    # byte[]) alone since variable expansion makes no sense for byte values.
+    # Comma operator preserves the array type through the pipeline.
+    if ($Value -is [array]) {
+        $allStrings = $true
+        foreach ($item in $Value) {
+            if ($item -isnot [string]) { $allStrings = $false; break }
+        }
+        if ($allStrings) {
+            $expanded = foreach ($item in $Value) { Expand-ConfigVariables -Value $item }
+            return ,[string[]]$expanded
+        }
+        return ,$Value
+    }
+
     return $Value
 }
 
@@ -500,7 +683,10 @@ function Compare-RegistryValue {
 
         [Parameter()]
         [ValidateSet('Equals', 'NotEquals', 'GreaterThan', 'GreaterThanOrEqual', 'LessThan', 'LessThanOrEqual', 'Contains', 'StartsWith', 'EndsWith', 'Exists', 'NotExists')]
-        [string]$Comparison = 'Equals'
+        [string]$Comparison = 'Equals',
+
+        [Parameter()]
+        [bool]$CaseSensitive = $false
     )
 
     try {
@@ -556,18 +742,42 @@ function Compare-RegistryValue {
         $match = $false
         $reason = ""
 
+        # Helper for string equality honoring CaseSensitive
+        $stringsEqual = {
+            param($a, $b)
+            if ($CaseSensitive) {
+                [string]::Equals([string]$a, [string]$b, [System.StringComparison]::Ordinal)
+            }
+            else {
+                [string]::Equals([string]$a, [string]$b, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+        }
+
         switch ($Comparison) {
             'Equals' {
-                # Handle binary comparison
+                # Handle binary comparison (always byte-exact)
                 if ($Type.ToLower() -eq 'binary') {
                     $match = $null -ne $actualValue -and
                              $actualValue.Length -eq $convertedExpected.Length -and
                              -not (Compare-Object $actualValue $convertedExpected)
                 }
-                # Handle multi-string comparison
+                # Handle multi-string comparison (per-element equality, honoring CaseSensitive)
                 elseif ($Type.ToLower() -eq 'multistring') {
-                    $match = $null -ne $actualValue -and
-                             -not (Compare-Object $actualValue $convertedExpected)
+                    if ($null -eq $actualValue -or $actualValue.Length -ne $convertedExpected.Length) {
+                        $match = $false
+                    }
+                    else {
+                        $match = $true
+                        for ($i = 0; $i -lt $actualValue.Length; $i++) {
+                            if (-not (& $stringsEqual $actualValue[$i] $convertedExpected[$i])) {
+                                $match = $false; break
+                            }
+                        }
+                    }
+                }
+                # String/ExpandString
+                elseif ($Type.ToLower() -in 'string', 'expandstring') {
+                    $match = & $stringsEqual $actualValue $convertedExpected
                 }
                 else {
                     $match = $actualValue -eq $convertedExpected
@@ -581,8 +791,20 @@ function Compare-RegistryValue {
                              (Compare-Object $actualValue $convertedExpected)
                 }
                 elseif ($Type.ToLower() -eq 'multistring') {
-                    $match = $null -eq $actualValue -or
-                             (Compare-Object $actualValue $convertedExpected)
+                    if ($null -eq $actualValue -or $actualValue.Length -ne $convertedExpected.Length) {
+                        $match = $true
+                    }
+                    else {
+                        $match = $false
+                        for ($i = 0; $i -lt $actualValue.Length; $i++) {
+                            if (-not (& $stringsEqual $actualValue[$i] $convertedExpected[$i])) {
+                                $match = $true; break
+                            }
+                        }
+                    }
+                }
+                elseif ($Type.ToLower() -in 'string', 'expandstring') {
+                    $match = -not (& $stringsEqual $actualValue $convertedExpected)
                 }
                 else {
                     $match = $actualValue -ne $convertedExpected
@@ -606,15 +828,27 @@ function Compare-RegistryValue {
                 $reason = if ($match) { "Value $actualValue <= $convertedExpected" } else { "Value $actualValue is not <= $convertedExpected" }
             }
             'Contains' {
-                $match = $actualValue -like "*$convertedExpected*"
+                if ($CaseSensitive) {
+                    $match = ([string]$actualValue).Contains([string]$convertedExpected)
+                } else {
+                    $match = $actualValue -like "*$convertedExpected*"
+                }
                 $reason = if ($match) { "Value contains '$convertedExpected'" } else { "Value does not contain '$convertedExpected'" }
             }
             'StartsWith' {
-                $match = $actualValue -like "$convertedExpected*"
+                if ($CaseSensitive) {
+                    $match = ([string]$actualValue).StartsWith([string]$convertedExpected, [System.StringComparison]::Ordinal)
+                } else {
+                    $match = $actualValue -like "$convertedExpected*"
+                }
                 $reason = if ($match) { "Value starts with '$convertedExpected'" } else { "Value does not start with '$convertedExpected'" }
             }
             'EndsWith' {
-                $match = $actualValue -like "*$convertedExpected"
+                if ($CaseSensitive) {
+                    $match = ([string]$actualValue).EndsWith([string]$convertedExpected, [System.StringComparison]::Ordinal)
+                } else {
+                    $match = $actualValue -like "*$convertedExpected"
+                }
                 $reason = if ($match) { "Value ends with '$convertedExpected'" } else { "Value does not end with '$convertedExpected'" }
             }
         }
@@ -631,6 +865,63 @@ function Compare-RegistryValue {
             Current = $null
             Reason  = "Error comparing: $_"
         }
+    }
+}
+
+function ConvertTo-RegToolPath {
+    <#
+    .SYNOPSIS
+        Converts PowerShell registry paths to reg.exe path syntax.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($Path -match '^Registry::HKEY_USERS\\(.+)$')         { return "HKU\$($Matches[1])" }
+    if ($Path -match '^Registry::HKEY_LOCAL_MACHINE\\(.+)$') { return "HKLM\$($Matches[1])" }
+    if ($Path -match '^Registry::HKEY_CURRENT_USER\\(.+)$')  { return "HKCU\$($Matches[1])" }
+    if ($Path -match '^Registry::HKEY_CLASSES_ROOT\\(.+)$')  { return "HKCR\$($Matches[1])" }
+    if ($Path -match '^HKLM:\\(.+)$')                         { return "HKLM\$($Matches[1])" }
+    if ($Path -match '^HKCU:\\(.+)$')                         { return "HKCU\$($Matches[1])" }
+    if ($Path -match '^HKU:\\(.+)$')                          { return "HKU\$($Matches[1])" }
+    if ($Path -match '^HKCR:\\(.+)$')                         { return "HKCR\$($Matches[1])" }
+    return $Path
+}
+
+function Backup-RegistryKey {
+    <#
+    .SYNOPSIS
+        Exports a registry key (recursively) to a .reg file for potential rollback.
+    .DESCRIPTION
+        Used before action=DeleteKey. Returns the absolute path of the .reg file,
+        or $null on failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$BackupRoot
+    )
+
+    try {
+        if (-not (Test-Path $BackupRoot)) {
+            New-Item -Path $BackupRoot -ItemType Directory -Force | Out-Null
+        }
+
+        $regPath = ConvertTo-RegToolPath -Path $Path
+        $rand = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+        $backupFile = Join-Path $BackupRoot "KeyBackup_${stamp}_${PID}_$rand.reg"
+
+        $regOutput = & reg.exe export $regPath $backupFile /y 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Failed to export key for backup: $regOutput" -Level Warning
+            return $null
+        }
+        Write-Log "Backed up key to: $backupFile" -Level Debug
+        return $backupFile
+    }
+    catch {
+        Write-Log "Exception backing up key: $_" -Level Warning
+        return $null
     }
 }
 
@@ -696,13 +987,14 @@ function Save-TransactionLog {
             New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
         }
         
-        $logFile = Join-Path $LogPath "Transaction_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        $logFile = Join-Path $LogPath "Transaction_$(Get-Date -Format 'yyyyMMdd_HHmmss_fff')_$PID.json"
         
         $logData = @{
-            EngineVersion = $script:EngineVersion
-            ComputerName  = $env:COMPUTERNAME
-            Timestamp     = (Get-Date).ToString("o")
-            Transactions  = $Transactions
+            EngineVersion    = $script:EngineVersion
+            ConfigIdentifier = $script:ConfigIdentifier
+            ComputerName     = $env:COMPUTERNAME
+            Timestamp        = (Get-Date).ToString("o")
+            Transactions     = $Transactions
         }
         
         $logData | ConvertTo-Json -Depth 10 | Out-File -FilePath $logFile -Encoding UTF8
@@ -723,37 +1015,85 @@ function Save-TransactionLog {
 function Get-Configuration {
     <#
     .SYNOPSIS
-        Loads and validates the JSON configuration file.
+        Loads and validates the JSON configuration.
+    .PARAMETER Path
+        Path to the config file (local, UNC, or https URL). Ignored when EmbeddedJson is supplied.
+    .PARAMETER Sha256
+        Optional SHA-256 hex digest for integrity verification of file/URL content.
+        Not applicable when EmbeddedJson is used (the embedded JSON is part of the
+        signed/distributed script body itself).
+    .PARAMETER EmbeddedJson
+        Pre-loaded JSON content (string). When supplied, file/URL loading is skipped.
+        Used by packaged Intune scripts via the INJECTION_POINT mechanism.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Path
+        [Parameter()]
+        [string]$Path,
+
+        [Parameter()]
+        [string]$Sha256,
+
+        [Parameter()]
+        [string]$EmbeddedJson
     )
-    
-    Write-Log "Loading configuration from: $Path" -Level Info
-    
+
     try {
-        # Handle URL-based configs
-        if ($Path -match '^https?://') {
+        # Step 1: Acquire raw JSON content
+        if ($EmbeddedJson) {
+            Write-Log "Loading embedded configuration..." -Level Info
+            $configContent = $EmbeddedJson
+        }
+        elseif ([string]::IsNullOrEmpty($Path)) {
+            throw "Configuration source is required: provide -Path or -EmbeddedJson."
+        }
+        elseif ($Path -match '^http://') {
+            throw "HTTP URLs are not supported. Configuration must be loaded over HTTPS."
+        }
+        elseif ($Path -match '^https://') {
+            Write-Log "Loading configuration from: $Path" -Level Info
             Write-Log "Downloading configuration from URL..." -Level Debug
-            $configContent = (Invoke-WebRequest -Uri $Path -UseBasicParsing).Content
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            try {
+                Invoke-WebRequest -Uri $Path -UseBasicParsing -OutFile $tempFile `
+                    -TimeoutSec 30 -MaximumRedirection 0 -ErrorAction Stop
+
+                if ($Sha256) {
+                    $actualHash = (Get-FileHash -Path $tempFile -Algorithm SHA256).Hash
+                    if (-not [string]::Equals($actualHash, $Sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "SHA-256 mismatch for downloaded configuration. Expected: $Sha256 Actual: $actualHash"
+                    }
+                    Write-Log "SHA-256 verified for downloaded configuration" -Level Debug
+                }
+
+                $configContent = Get-Content -Path $tempFile -Raw -Encoding UTF8
+            }
+            finally {
+                Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+            }
         }
         elseif (Test-Path $Path) {
+            Write-Log "Loading configuration from: $Path" -Level Info
+            if ($Sha256) {
+                $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+                if (-not [string]::Equals($actualHash, $Sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "SHA-256 mismatch for configuration file. Expected: $Sha256 Actual: $actualHash"
+                }
+                Write-Log "SHA-256 verified for configuration file" -Level Debug
+            }
             $configContent = Get-Content -Path $Path -Raw -Encoding UTF8
         }
         else {
             throw "Configuration file not found: $Path"
         }
-        
+
+        # Step 2: Parse + validate (shared between embedded and file paths)
         $config = $configContent | ConvertFrom-Json
-        
-        # Validate required properties
+
         if (-not $config.settings -or $config.settings.Count -eq 0) {
             throw "Configuration must contain at least one setting in the 'settings' array"
         }
-        
-        # Validate each setting
+
         foreach ($setting in $config.settings) {
             if (-not $setting.scope) {
                 throw "Each setting must have a 'scope' (Machine, User, or DefaultUser)"
@@ -766,9 +1106,8 @@ function Get-Configuration {
                 $setting | Add-Member -NotePropertyName 'action' -NotePropertyValue 'Set' -Force
             }
         }
-        
+
         Write-Log "Configuration loaded successfully: $($config.settings.Count) setting group(s)" -Level Success
-        
         return $config
     }
     catch {
@@ -817,10 +1156,15 @@ function Invoke-DetectionMode {
             'user' {
                 $userProfiles = Get-UserProfileSIDs
                 foreach ($userProfile in $userProfiles) {
-                    $registryPaths += @{
-                        Path     = "$($userProfile.HivePath)\$basePath"
-                        Context  = "User: $($userProfile.Username)"
+                    $entry = @{
+                        Path    = "$($userProfile.HivePath)\$basePath"
+                        Context = "User: $($userProfile.Username)"
                     }
+                    # Newly mounted (signed-out) profile — caller must dismount
+                    if ($userProfile.HiveInfo) {
+                        $entry.HiveInfo = $userProfile.HiveInfo
+                    }
+                    $registryPaths += $entry
                 }
             }
             'defaultuser' {
@@ -849,8 +1193,10 @@ function Invoke-DetectionMode {
 
                         $expandedValue = Expand-ConfigVariables -Value $value.data
                         $comparisonOperator = if ($value.comparison) { $value.comparison } else { 'Equals' }
+                        $caseSensitive = [bool]($value.caseSensitive -eq $true)
                         $comparison = Compare-RegistryValue -Path $fullPath -Name $value.name `
-                            -Type $value.type -ExpectedValue $expandedValue -Comparison $comparisonOperator
+                            -Type $value.type -ExpectedValue $expandedValue -Comparison $comparisonOperator `
+                            -CaseSensitive $caseSensitive
 
                         if (-not $comparison.Match) {
                             $compliant = $false
@@ -906,7 +1252,7 @@ function Invoke-DetectionMode {
             
             # Dismount default user hive if it was loaded
             if ($regPath.HiveInfo -and $regPath.HiveInfo.NeedsUnload) {
-                Dismount-DefaultUserHive -TempKey $regPath.HiveInfo.TempKey
+                Dismount-RegistryHive -TempKey $regPath.HiveInfo.TempKey
             }
         }
     }
@@ -916,7 +1262,7 @@ function Invoke-DetectionMode {
         return @{
             Compliant = $true
             ExitCode  = $script:ExitCodes.Compliant
-            Message   = "$script:LogPrefix COMPLIANT - All settings are correct"
+            Message   = "$script:LogPrefix [$script:ConfigIdentifier] COMPLIANT - All settings are correct"
         }
     }
     else {
@@ -925,7 +1271,7 @@ function Invoke-DetectionMode {
             Compliant        = $false
             ExitCode         = $script:ExitCodes.NonCompliant
             NonCompliantItems = $nonCompliantItems
-            Message          = "$script:LogPrefix NON-COMPLIANT - $($nonCompliantItems.Count) setting(s) need remediation"
+            Message          = "$script:LogPrefix [$script:ConfigIdentifier] NON-COMPLIANT - $($nonCompliantItems.Count) setting(s) need remediation"
         }
     }
 }
@@ -970,10 +1316,15 @@ function Invoke-RemediationMode {
             'user' {
                 $userProfiles = Get-UserProfileSIDs
                 foreach ($userProfile in $userProfiles) {
-                    $registryPaths += @{
-                        Path     = "$($userProfile.HivePath)\$basePath"
-                        Context  = "User: $($userProfile.Username)"
+                    $entry = @{
+                        Path    = "$($userProfile.HivePath)\$basePath"
+                        Context = "User: $($userProfile.Username)"
                     }
+                    # Newly mounted (signed-out) profile — caller must dismount
+                    if ($userProfile.HiveInfo) {
+                        $entry.HiveInfo = $userProfile.HiveInfo
+                    }
+                    $registryPaths += $entry
                 }
             }
             'defaultuser' {
@@ -1059,16 +1410,37 @@ function Invoke-RemediationMode {
                     }
                     'deletekey' {
                         if (Test-Path $fullPath) {
-                            # For key deletion, we backup the entire key structure
-                            $transactions += @{
-                                Path      = $fullPath
-                                Name      = "(Key)"
-                                Timestamp = (Get-Date).ToString("o")
-                                Existed   = $true
-                                Type      = "Key"
-                                Value     = "(Key structure not backed up for rollback)"
+                            # Determine restorability category before deletion:
+                            #   Machine     - reg.exe import at rollback fully restores
+                            #   MountedUser - .reg references HKEY_USERS\<sid>; restores
+                            #                 if the same user is signed in at rollback time
+                            #   TempMount   - DefaultUser, or a user we mounted ourselves;
+                            #                 the temp mount won't exist at rollback. Backup
+                            #                 file is retained for manual recovery.
+                            $backupKind = switch ($scope.ToLower()) {
+                                'machine'     { 'Machine' }
+                                'defaultuser' { 'TempMount' }
+                                'user'        { if ($regPath.HiveInfo) { 'TempMount' } else { 'MountedUser' } }
+                                default       { 'Unknown' }
                             }
-                            
+
+                            $backupFile = $null
+                            if (-not $WhatIfPreference) {
+                                $backupRoot = Join-Path $TransactionLogPath 'KeyBackups'
+                                $backupFile = Backup-RegistryKey -Path $fullPath -BackupRoot $backupRoot
+                            }
+
+                            $transactions += @{
+                                Path       = $fullPath
+                                Name       = "(Key)"
+                                Timestamp  = (Get-Date).ToString("o")
+                                Existed    = $true
+                                Type       = "Key"
+                                Value      = $null
+                                BackupFile = $backupFile
+                                BackupKind = $backupKind
+                            }
+
                             if ($PSCmdlet.ShouldProcess($fullPath, "Delete registry key")) {
                                 Remove-Item -Path $fullPath -Recurse -Force
                                 Write-Log "Deleted key: $($regPath.Context) - $fullPath" -Level Success
@@ -1087,7 +1459,7 @@ function Invoke-RemediationMode {
             finally {
                 # Dismount default user hive if it was loaded
                 if ($regPath.HiveInfo -and $regPath.HiveInfo.NeedsUnload) {
-                    Dismount-DefaultUserHive -TempKey $regPath.HiveInfo.TempKey
+                    Dismount-RegistryHive -TempKey $regPath.HiveInfo.TempKey
                 }
             }
         }
@@ -1112,7 +1484,7 @@ function Invoke-RemediationMode {
             ExitCode       = $script:ExitCodes.RemediationOK
             ChangesCount   = $changesApplied
             RebootRequired = $rebootRequired
-            Message        = "$script:LogPrefix SUCCESS - $changesApplied change(s) applied"
+            Message        = "$script:LogPrefix [$script:ConfigIdentifier] SUCCESS - $changesApplied change(s) applied"
         }
     }
     else {
@@ -1121,7 +1493,7 @@ function Invoke-RemediationMode {
             Success  = $false
             ExitCode = $script:ExitCodes.RemediationFail
             Errors   = $errors
-            Message  = "$script:LogPrefix FAILED - Errors: $($errors -join '; ')"
+            Message  = "$script:LogPrefix [$script:ConfigIdentifier] FAILED - Errors: $($errors -join '; ')"
         }
     }
 }
@@ -1136,25 +1508,56 @@ function Invoke-RollbackMode {
         [Parameter(Mandatory)]
         [string]$TransactionFile
     )
-    
-    Write-Log "Starting rollback from: $TransactionFile" -Level Info
-    
+
+    # Resolve the config identifier before any Write-Log fires so every line
+    # is tagged correctly. Start from the transaction filename as a fallback,
+    # then upgrade from the embedded ConfigIdentifier field once the file is
+    # parsed (older transaction files won't have the field).
+    $script:ConfigIdentifier = [System.IO.Path]::GetFileNameWithoutExtension($TransactionFile)
+
     if (-not (Test-Path $TransactionFile)) {
         Write-Log "Transaction file not found: $TransactionFile" -Level Error
         return @{
             Success  = $false
             ExitCode = $script:ExitCodes.ConfigError
-            Message  = "$script:LogPrefix ROLLBACK FAILED - Transaction file not found"
+            Message  = "$script:LogPrefix [$script:ConfigIdentifier] ROLLBACK FAILED - Transaction file not found"
         }
     }
-    
+
     try {
         $logData = Get-Content -Path $TransactionFile -Raw | ConvertFrom-Json
+        if ($logData.ConfigIdentifier) {
+            $script:ConfigIdentifier = $logData.ConfigIdentifier
+        }
+
+        # Identifier is now final — emit the engine banner and the start line.
+        Write-Log "Registry Configuration Engine v$script:EngineVersion" -Level Info
+        Write-Log "Mode: Rollback | Computer: $env:COMPUTERNAME | User: $env:USERNAME" -Level Debug
+        Write-Log "Starting rollback from: $TransactionFile" -Level Info
+
         $rolledBack = 0
         
         foreach ($tx in $logData.Transactions) {
             if ($tx.Type -eq "Key") {
-                Write-Log "Cannot rollback key deletion: $($tx.Path)" -Level Warning
+                if (-not $tx.BackupFile -or -not (Test-Path -LiteralPath $tx.BackupFile)) {
+                    Write-Log "Cannot rollback key deletion (no backup file): $($tx.Path)" -Level Warning
+                    continue
+                }
+                if ($tx.BackupKind -eq 'TempMount') {
+                    Write-Log "Cannot auto-restore key for DefaultUser/unmounted user profile: $($tx.Path). Backup retained at $($tx.BackupFile) for manual recovery." -Level Warning
+                    continue
+                }
+
+                if ($PSCmdlet.ShouldProcess($tx.Path, "Restore registry key from backup")) {
+                    $regImport = & reg.exe import $tx.BackupFile 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "Restored key: $($tx.Path) (from $($tx.BackupFile))" -Level Success
+                        $rolledBack++
+                    }
+                    else {
+                        Write-Log "Failed to restore key from $($tx.BackupFile): $regImport" -Level Error
+                    }
+                }
                 continue
             }
             
@@ -1187,7 +1590,7 @@ function Invoke-RollbackMode {
         return @{
             Success  = $true
             ExitCode = $script:ExitCodes.Compliant
-            Message  = "$script:LogPrefix ROLLBACK SUCCESS - $rolledBack change(s) reverted"
+            Message  = "$script:LogPrefix [$script:ConfigIdentifier] ROLLBACK SUCCESS - $rolledBack change(s) reverted"
         }
     }
     catch {
@@ -1195,7 +1598,7 @@ function Invoke-RollbackMode {
         return @{
             Success  = $false
             ExitCode = $script:ExitCodes.RemediationFail
-            Message  = "$script:LogPrefix ROLLBACK FAILED - $_"
+            Message  = "$script:LogPrefix [$script:ConfigIdentifier] ROLLBACK FAILED - $_"
         }
     }
 }
@@ -1204,29 +1607,91 @@ function Invoke-RollbackMode {
 
 #region Main Execution
 
+# Dot-source guard: when this file is dot-sourced (e.g., by Pester), do not
+# execute the main flow — only define functions for testing. $MyInvocation
+# .InvocationName is '.' for dot-source; anything else (script path, '&', etc.)
+# means normal execution.
+if ($MyInvocation.InvocationName -ne '.') {
+
 try {
-    Write-Log "Registry Configuration Engine v$script:EngineVersion" -Level Info
-    Write-Log "Mode: $Mode | Computer: $env:COMPUTERNAME | User: $env:USERNAME" -Level Debug
-    
-    # Determine config path
-    if ([string]::IsNullOrEmpty($ConfigPath)) {
-        $ConfigPath = Join-Path $PSScriptRoot "config.json"
+    # Apply injection-time overrides for packaged Intune scripts. No-op for
+    # standalone (the variables default to $null/$false in the INJECTION_POINT
+    # region above).
+    if ($script:__ForcedMode)     { $Mode = $script:__ForcedMode }
+    if ($script:__ForcedEventLog) { $CreateEventLog = $true }
+
+    # Engine banner is emitted AFTER the config identifier is resolved, so the
+    # log lines tag correctly. For Detect/Remediate/Validate that's right after
+    # Get-Configuration; for Rollback it's inside Invoke-RollbackMode after the
+    # transaction file is parsed.
+
+    # Clean up any temp hives left behind by previously crashed runs.
+    # Skipped for Validate (no registry access expected) and Rollback (which
+    # restores values, not mount state).
+    if ($Mode -in 'Detect', 'Remediate') {
+        Remove-OrphanedTempHives
     }
-    
-    # Handle rollback mode separately
+
+    # Handle rollback mode separately (always reads from a transaction file path)
     if ($Mode -eq 'Rollback') {
+        if ([string]::IsNullOrEmpty($ConfigPath)) {
+            throw "Rollback mode requires -ConfigPath pointing to a transaction file."
+        }
         $result = Invoke-RollbackMode -TransactionFile $ConfigPath
         Write-Output $result.Message
         exit $result.ExitCode
     }
-    
-    # Load configuration
-    $config = Get-Configuration -Path $ConfigPath
-    
+
+    # Default ConfigPath when running standalone with no explicit path
+    # (so the provisional identifier derivation below has something to work with).
+    if (-not $script:__EmbeddedConfig -and [string]::IsNullOrEmpty($ConfigPath)) {
+        $ConfigPath = Join-Path $PSScriptRoot "config.json"
+    }
+
+    # Provisional identifier from path so config-load log lines tag correctly.
+    # Refined after load if the config has a description field (embedded case).
+    if ($ConfigPath -and $ConfigPath -notmatch '^https?://') {
+        $script:ConfigIdentifier = [System.IO.Path]::GetFileNameWithoutExtension($ConfigPath)
+    }
+    elseif ($ConfigPath -match '^https?://') {
+        $script:ConfigIdentifier = [System.IO.Path]::GetFileNameWithoutExtension(([Uri]$ConfigPath).Segments[-1])
+    }
+
+    # Load configuration: embedded (packaged scripts) takes precedence over file/URL
+    if ($script:__EmbeddedConfig) {
+        $config = Get-Configuration -EmbeddedJson $script:__EmbeddedConfig
+    }
+    else {
+        $config = Get-Configuration -Path $ConfigPath -Sha256 $ConfigSha256
+    }
+
+    # Derive the config identifier from whichever source we just loaded.
+    # File path → filename without extension; URL → last URL segment without extension;
+    # embedded → sanitised description if present, else "embedded-config".
+    if ($ConfigPath -and $ConfigPath -notmatch '^https?://') {
+        $script:ConfigIdentifier = [System.IO.Path]::GetFileNameWithoutExtension($ConfigPath)
+    }
+    elseif ($ConfigPath -match '^https?://') {
+        $script:ConfigIdentifier = [System.IO.Path]::GetFileNameWithoutExtension(([Uri]$ConfigPath).Segments[-1])
+    }
+    elseif ($script:__EmbeddedConfig) {
+        $script:ConfigIdentifier = if ($config.description) {
+            ($config.description -replace '[^\w\-]', '_').Substring(0, [Math]::Min(50, $config.description.Length))
+        } else {
+            "embedded-config"
+        }
+    }
+
+    # Identifier is now resolved — emit the engine banner so every line tags
+    # correctly (Rollback emits its banner inside Invoke-RollbackMode after
+    # reading the transaction file).
+    Write-Log "Registry Configuration Engine v$script:EngineVersion" -Level Info
+    Write-Log "Mode: $Mode | Computer: $env:COMPUTERNAME | User: $env:USERNAME" -Level Debug
+
     # Validation mode - just parse and validate
     if ($Mode -eq 'Validate') {
         Write-Log "Configuration validation successful" -Level Success
-        Write-Output "$script:LogPrefix VALIDATION OK - Configuration is valid ($($config.settings.Count) setting groups)"
+        Write-Output "$script:LogPrefix [$script:ConfigIdentifier] VALIDATION OK - Configuration is valid ($($config.settings.Count) setting groups)"
         exit $script:ExitCodes.Compliant
     }
     
@@ -1245,10 +1710,12 @@ try {
     }
 }
 catch {
-    $errorMessage = "$script:LogPrefix ERROR - $_"
+    $errorMessage = "$script:LogPrefix [$script:ConfigIdentifier] ERROR - $_"
     Write-Log $errorMessage -Level Error -EventId 9999
     Write-Output $errorMessage
     exit $script:ExitCodes.ConfigError
 }
+
+} # end dot-source guard
 
 #endregion
